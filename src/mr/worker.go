@@ -2,6 +2,7 @@ package mr
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,12 +33,15 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	defer log.Println("exited worker .......")
+	// defer log.Println("exited worker .......")
+
+	ctx, cancel := context.WithCancel(context.TODO())
+	defer cancel()
 
 	for {
 		time.Sleep(time.Millisecond * 100)
 
-		task, err := GetTask()
+		task, err := GetTask(nil)
 		if err != nil {
 			log.Fatalln(err.Error())
 			return
@@ -51,13 +56,13 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		if task.Done {
-			log.Println("done ...")
+			// log.Println("done ...")
 			return
 		}
 
 		stage := task.Stage
 		if stage == stageMap {
-			if err := processMap(mapf, task.SplitFilePath, task.SplitIndex, task.NReduce); err != nil {
+			if err := processMap(ctx, mapf, task.SplitFilePath, task.SplitIndex, task.NReduce); err != nil {
 				log.Fatal(err)
 				return
 			}
@@ -68,7 +73,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		if stage == stageReduce {
-			if err := processReduce(reducef, task.SplitNum, task.ReduceIndex); err != nil {
+			if err := processReduce(ctx, reducef, task.SplitNum, task.ReduceIndex); err != nil {
 				log.Fatal(err)
 				return
 			}
@@ -81,6 +86,23 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
+func heartBeat(ctx context.Context, g *sync.WaitGroup, stage, index int) {
+	defer g.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		GetTask(&getParams{
+			stage: stage,
+			index: index,
+		})
+		time.Sleep(time.Millisecond * 300)
+	}
+}
+
 // for sorting by key.
 type ByKey []KeyValue
 
@@ -89,7 +111,66 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-func processReduce(reducef func(string, []string) string, splitNum int, reduceIndex int) error {
+func processMap(ctx context.Context, mapf func(string, string) []KeyValue, filename string, index int, nReduce int) error {
+	// log.Printf("start map, split file: %v, index: %v, reduce: %v\n", filename, index, nReduce)
+
+	g := sync.WaitGroup{}
+	defer g.Wait()
+
+	nctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g.Add(1)
+	go heartBeat(nctx, &g, stageMap, index)
+
+	// time.Sleep(time.Second * 2)
+
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+		return nil
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	kva := mapf(filename, string(content))
+
+	ofiles := make([]*os.File, 0)
+
+	for i := 0; i < nReduce; i++ {
+		oname := fmt.Sprintf("%v-%v.txt", index, i)
+		ofile, _ := os.Create(oname)
+		defer ofile.Close()
+		ofiles = append(ofiles, ofile)
+	}
+
+	// save intermediate result by partition
+	for i := range kva {
+		r := ihash(kva[i].Key) % nReduce
+		f := ofiles[r]
+		fmt.Fprintf(f, "%v %v\n", kva[i].Key, kva[i].Value)
+	}
+
+	// log.Printf("start map, split file: %v, index: %v, reduce: %v, done ........\n", filename, index, nReduce)
+
+	return nil
+}
+
+func processReduce(ctx context.Context, reducef func(string, []string) string, splitNum int, reduceIndex int) error {
+	// log.Printf("start reduce, reduceIndex: %v\n", reduceIndex)
+
+	g := sync.WaitGroup{}
+	defer g.Wait()
+
+	nctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	g.Add(1)
+	go heartBeat(nctx, &g, stageReduce, reduceIndex)
+
 	intermediate := []KeyValue{}
 
 	for i := 0; i < splitNum; i++ {
@@ -153,47 +234,20 @@ func processReduce(reducef func(string, []string) string, splitNum int, reduceIn
 	return nil
 }
 
-func processMap(mapf func(string, string) []KeyValue, filename string, index int, nReduce int) error {
-	log.Printf("start map, split file: %v, index: %v, reduce: %v\n", filename, index, nReduce)
-
-	file, err := os.Open(filename)
-	if err != nil {
-		log.Fatalf("cannot open %v", filename)
-		return nil
-	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatalf("cannot read %v", filename)
-	}
-	file.Close()
-
-	kva := mapf(filename, string(content))
-
-	ofiles := make([]*os.File, 0)
-
-	for i := 0; i < nReduce; i++ {
-		oname := fmt.Sprintf("%v-%v.txt", index, i)
-		ofile, _ := os.Create(oname)
-		defer ofile.Close()
-		ofiles = append(ofiles, ofile)
-	}
-
-	// save intermediate result by partition
-	for i := range kva {
-		r := ihash(kva[i].Key) % nReduce
-		f := ofiles[r]
-		fmt.Fprintf(f, "%v %v\n", kva[i].Key, kva[i].Value)
-	}
-
-	log.Printf("start map, split file: %v, index: %v, reduce: %v, done ........\n", filename, index, nReduce)
-
-	return nil
+type getParams struct {
+	stage int
+	index int
 }
 
-func GetTask() (*TaskReply, error) {
+func GetTask(params *getParams) (*TaskReply, error) {
 
 	// declare an argument structure.
 	args := TaskArgs{}
+	if params != nil {
+		args.Stage = params.stage
+		args.Index = params.index
+		args.HeartBeat = true
+	}
 
 	// fill in the argument(s).
 

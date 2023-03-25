@@ -8,6 +8,7 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
+	"time"
 )
 
 const (
@@ -28,14 +29,29 @@ type Coordinator struct {
 	markMapTask    map[int]bool
 	markReduceTask map[int]bool
 
+	aliveMapTask    map[int]time.Time
+	aliveReduceTask map[int]time.Time
+
 	mtx sync.Mutex
 
 	splitNum  int
 	reduceNum int
 	files     []string
+
+	timeout time.Duration
 }
 
 // Your code here -- RPC handlers for the worker to call.
+
+func (c *Coordinator) findTimeoutTask(memo map[int]time.Time, state map[int]bool) int {
+	for k, v := range memo {
+		if !state[k] && time.Since(v) >= c.timeout {
+			return k
+		}
+	}
+
+	return -1
+}
 
 func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 	c.mtx.Lock()
@@ -48,33 +64,65 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 		return nil
 	}
 
-	if c.stage == stageMap {
-		if c.indexToMap >= c.splitNum {
-			reply.Wait = true
-			// log.Printf("indexToMap:%v, split num: %v, no task for map \n", c.indexToMap, c.splitNum)
-			return nil
+	if args.HeartBeat {
+		if c.stage == stageMap {
+			c.aliveMapTask[args.Index] = time.Now()
 		}
-		reply.SplitIndex = c.indexToMap
+		if c.stage == stageReduce {
+			c.aliveReduceTask[args.Index] = time.Now()
+		}
+		return nil
+	}
+
+	if c.stage == stageMap {
+		index := 0
+
+		if c.indexToMap >= c.splitNum {
+			// find timeout task
+			t := c.findTimeoutTask(c.aliveMapTask, c.markMapTask)
+			if t < 0 {
+				reply.Wait = true
+				// log.Printf("indexToMap:%v, split num: %v, no task for map \n", c.indexToMap, c.splitNum)
+				return nil
+			}
+
+			index = t
+		} else {
+			index = c.indexToMap
+			c.indexToMap += 1
+		}
+
+		reply.SplitIndex = index
 		reply.SplitFilePath = c.files[reply.SplitIndex]
 		reply.NReduce = c.reduceNum
 
+		c.aliveMapTask[index] = time.Now()
 		log.Printf("map SplitIndex:%v, SplitFilePath: %v,\n", reply.SplitIndex, reply.SplitFilePath)
 
-		c.indexToMap += 1
 		return nil
 	} else if c.stage == stageReduce {
+		index := 0
+
 		if c.indexToReduce >= c.reduceNum {
-			// log.Printf("indexToMap:%v, split num: %v, no task for reduce \n", c.indexToMap, c.splitNum)
-			reply.Wait = true
-			return nil
+			// find timeout task
+			t := c.findTimeoutTask(c.aliveReduceTask, c.markReduceTask)
+			if t < 0 {
+				reply.Wait = true
+				// log.Printf("indexToMap:%v, split num: %v, no task for reduce \n", c.indexToMap, c.splitNum)
+				return nil
+			}
+			index = t
+		} else {
+			index = c.indexToReduce
+			c.indexToReduce += 1
 		}
 
-		reply.ReduceIndex = c.indexToReduce
+		reply.ReduceIndex = index
 		reply.SplitNum = c.splitNum
 
+		c.aliveReduceTask[index] = time.Now()
 		log.Printf("reduce ReduceIndex:%v, SplitNum: %v,\n", reply.ReduceIndex, reply.SplitNum)
 
-		c.indexToReduce += 1
 	} else {
 		err := fmt.Errorf("invalid internal stage: %v", c.stage)
 		reply.Err = err.Error()
@@ -103,7 +151,7 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
 			c.markMapTask[args.SplitIndex] = true
 
 			if c.allMarked(c.markMapTask) {
-				log.Println("stage from map -----------> reduce")
+				// log.Println("stage from map -----------> reduce")
 				c.stage = stageReduce
 			}
 			return nil
@@ -158,7 +206,7 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	log.Printf("files: %v, nReduce:%v \n", files, nReduce)
+	// log.Printf("files: %v, nReduce:%v \n", files, nReduce)
 
 	c := Coordinator{}
 
@@ -170,19 +218,24 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	}
 
 	c.markMapTask = make(map[int]bool, 0)
+	c.aliveMapTask = make(map[int]time.Time, 0)
 	for i := 0; i < len(files); i++ {
 		c.markMapTask[i] = false
+		c.aliveMapTask[i] = time.Now()
 	}
 
 	c.markReduceTask = make(map[int]bool, 0)
+	c.aliveReduceTask = make(map[int]time.Time, 0)
 	for i := 0; i < nReduce; i++ {
 		c.markReduceTask[i] = false
+		c.aliveReduceTask[i] = time.Now()
 	}
 
 	c.stage = stageMap
 	c.splitNum = len(files)
 	c.reduceNum = nReduce
 	c.files = files
+	c.timeout = time.Second * 5
 
 	c.server()
 	return &c

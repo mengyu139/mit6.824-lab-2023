@@ -17,6 +17,9 @@ import (
 //
 
 type TaskArgs struct {
+	HeartBeat bool
+	Stage     int
+	Index     int
 }
 
 type TaskReply struct {
